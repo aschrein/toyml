@@ -1,2 +1,3 @@
 bindeps/
 venv/
+toyml.egg-info/

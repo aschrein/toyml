@@ -18,8 +18,8 @@ N       = 1 << 20
 data    = memoryview(bytearray(N * 4)).cast("i")
 for i in range(N): data[i] = i
 device = wgpu.utils.get_default_device()
-adapters = wgpu.gpu.enumerate_adapters()
-for a in adapters: print(a.summary)
+# adapters = wgpu.gpu.enumerate_adapters()
+# for a in adapters: print(a.summary)
 cshader = device.create_shader_module(code=shader_source)
 gpu_buffer = device.create_buffer(
     size=data.nbytes,

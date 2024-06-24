@@ -1,5 +1,3 @@
-# Copyright (c) 2024 Anton Schreiner
-
 import torch
 import numpy as np
 
