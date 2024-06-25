@@ -113,7 +113,7 @@ class SmolUnet(torch.nn.Module):
         x9 = self.smol_block_up_3(x1 + x8)
         x10 = self.feature_reconstruction_conv(x0 + x9)
         x11 = torch.nn.Sigmoid()(x10)
-        return x10
+        return x11
 
 
 def get_model():
