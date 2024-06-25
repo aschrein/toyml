@@ -1,3 +1,5 @@
 bindeps/
 venv/
 toyml.egg-info/
+.tmp/
+__pycache__/
