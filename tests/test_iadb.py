@@ -47,6 +47,7 @@ def sample_iadb(model, x0, nb_step):
 assert torch.cuda.is_available()
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 # Load cats
+# https://www.kaggle.com/datasets/spandan2/cats-faces-64x64-for-generative-models
 size            = 64
 cat_tensors     = []
 MAX_NUM_CATS    = 1 << 10
