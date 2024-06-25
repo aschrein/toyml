@@ -19,5 +19,8 @@ if not exist venv (
 call venv\Scripts\activate.bat
 python.exe -m pip install -r requirements.txt
 pip install -e .
+echo "------------------------"
+echo "------ SUCCESS ---------"
+echo "------------------------"
 powershell
 
