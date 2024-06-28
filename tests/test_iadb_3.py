@@ -44,6 +44,9 @@ class SmolBlock(torch.nn.Module):
         self.dwconv         = torch.nn.Conv2d(in_channels=out_channels,
                                               out_channels=out_channels, kernel_size=1, stride=1, padding=0,
                                               groups=1, bias=True)
+        self.dwconv2         = torch.nn.Conv2d(in_channels=out_channels,
+                                              out_channels=out_channels, kernel_size=1, stride=1, padding=0,
+                                              groups=1, bias=True)
         # self.spline_degree  = 4
         # self.spline_k       = torch.nn.Parameter(torch.randn(self.spline_degree, 1, out_channels, 1, 1), requires_grad=True)
         self.activation     = torch.nn.GELU()
@@ -57,6 +60,12 @@ class SmolBlock(torch.nn.Module):
         # apply spline
         # x = x1 + self.activation2(x)
         x = self.activation(x1)
+
+        x2 = self.dwconv2(x)
+
+        x2 = self.activation(x2)
+
+        x = x + x2
         # x = x * self.spline_k[0] / 1.0 + self.activation2(x) * self.spline_k[1] / 1.0
         return x
 
@@ -129,44 +138,51 @@ class GaussianStrokes(torch.nn.Module):
 def luma(x):
     return (0.2126 * x[:, 0] + 0.7152 * x[:, 1] + 0.0722 * x[:, 2]).unsqueeze(1)
 
+def kuwahara(input, kernel_size, device):
+    x           = input[:, 0:3, :, :]
+    k           = input[:, 3, :, :].unsqueeze(1)
+    invwidth    = 64.0 * (1.0 - k)
+    power       = 64.0 * k
+    mean        = torch.nn.AvgPool2d(kernel_size=kernel_size, stride=1, padding=kernel_size//2)(luma(x))
+    mean_sq     = torch.nn.AvgPool2d(kernel_size=kernel_size, stride=1, padding=kernel_size//2)(luma(x)**2)
+    variance    = torch.abs(mean_sq - mean**2)
+    # power       = 16.0
+    weights     = torch.exp(-variance * power)
+
+    N, C, H, W = x.shape
+    X = torch.range(0, W-1, device=device).view(1, 1, 1, W).expand(N, 1, H, W)
+    Y = torch.range(0, H-1, device=device).view(1, 1, H, 1).expand(N, 1, H, W)
+    acc = torch.zeros_like(x)
+    wacc = torch.zeros((N, 1, H, W), device=device)
+    for _dy in range(kernel_size):
+        for _dx in range(kernel_size):
+            dx = _dx - kernel_size // 2
+            dy = _dy - kernel_size // 2
+            _X = X + dx
+            _Y = Y + dy
+            _U = _X / W
+            _V = _Y / H
+            _ndc = torch.cat([_U, _V], dim=1) * 2.0 - 1.0
+            v = torch.nn.functional.grid_sample(x, _ndc.permute(0, 2, 3, 1), mode='nearest', padding_mode='border')
+            w = torch.nn.functional.grid_sample(weights, _ndc.permute(0, 2, 3, 1), mode='nearest', padding_mode='border')
+            w *= torch.exp(-invwidth * (
+                                torch.tensor([(dx / kernel_size)**2]) + torch.tensor([(dy / kernel_size)**2])
+                                ).to(device))
+            # bias center pixel
+            if (dx == 0) and (dy == 0):
+                w += torch.lerp(torch.tensor([16.0], device=device), torch.tensor([1.0e-3], device=device), k)
+            acc += v * w
+            wacc += w
+
+    return torch.lerp(input[:, 0:3, :, :], acc / wacc, k)
+
 class KuwaharaBlock(torch.nn.Module):
     def __init__(self, device, kernel_size=3) -> None:
         super().__init__()
         self.kernel_size = kernel_size
         self.device = device
 
-    def forward(self, input):
-        x           = input[:, 0:3, :, :]
-        power       = 16.0 * input[:, 3, :, :].unsqueeze(1)
-        mean        = torch.nn.AvgPool2d(kernel_size=self.kernel_size, stride=1, padding=self.kernel_size//2)(luma(x))
-        mean_sq     = torch.nn.AvgPool2d(kernel_size=self.kernel_size, stride=1, padding=self.kernel_size//2)(luma(x)**2)
-        variance    = torch.abs(mean_sq - mean**2)
-        # power       = 16.0
-        weights     = torch.exp(-variance * power)
-
-        N, C, H, W = x.shape
-        X = torch.range(0, W-1, device=self.device).view(1, 1, 1, W).expand(N, 1, H, W)
-        Y = torch.range(0, H-1, device=self.device).view(1, 1, H, 1).expand(N, 1, H, W)
-        acc = torch.zeros_like(x)
-        wacc = torch.zeros((N, 1, H, W), device=self.device)
-        for _dy in range(self.kernel_size):
-            for _dx in range(self.kernel_size):
-                dx = _dx - self.kernel_size // 2
-                dy = _dy - self.kernel_size // 2
-                _X = X + dx
-                _Y = Y + dy
-                _U = _X / W
-                _V = _Y / H
-                _ndc = torch.cat([_U, _V], dim=1) * 2.0 - 1.0
-                v = torch.nn.functional.grid_sample(x, _ndc.permute(0, 2, 3, 1), mode='nearest', padding_mode='border')
-                w = torch.nn.functional.grid_sample(weights, _ndc.permute(0, 2, 3, 1), mode='nearest', padding_mode='border')
-                w *= torch.exp(-(
-                                    torch.tensor([(dx / self.kernel_size)**2]) + torch.tensor([(dy / self.kernel_size)**2])
-                                  ).to(self.device))
-                acc += v * w
-                wacc += w
-
-        return acc / wacc
+    def forward(self, _input): return kuwahara(_input, self.kernel_size, self.device)
 
 class SmolUnet(torch.nn.Module):
 
@@ -183,7 +199,7 @@ class SmolUnet(torch.nn.Module):
         self.down_modules   = []
         num_features        = self.num_features_1
         mip_size            = input_resolution
-        while mip_size > 1:
+        while mip_size > 2:
             num_features    *= 2
             self.down_modules.append(SmolBlock(out_channels=num_features, in_channels=num_features // 2, kernel_size=3, stride=1, padding=1)
                                      .to(device))
@@ -222,11 +238,12 @@ class SmolUnet(torch.nn.Module):
                        ], dim=1)
         fc = self.feature_extraction_conv(x)
         x0 = fc
-        downs = []
+        downs = [fc]
         for down_module in self.down_modules:
             x0 = down_module(x0)
             x0 = torch.nn.MaxPool2d(kernel_size=2, stride=2)(x0)
             x0 = torch.nn.BatchNorm2d(x0.shape[1], device=x0.device)(x0)
+            # x0 = torch.nn.functional.normalize(x0, p=2, dim=1)
             downs.append(x0)
             # print(f"x0.shape = {x0.shape}")
 
@@ -245,14 +262,13 @@ class SmolUnet(torch.nn.Module):
                 x1 = torch.nn.Upsample(scale_factor=2, mode='bilinear')(x1)
             # x1 = torch.nn.BatchNorm2d(x1.shape[1], device=x0.device)(x1)
 
-        x1 = self.feature_final_conv(x1 + fc)
+        x1 = self.feature_final_conv(x1)
         # x1 = torch.tanh(x1)
-        # x1[:, 0:3, :, :] = torch.nn.BatchNorm2d(num_features=3, device=x1.device)(x1[:, 0:3, :, :])
+        x1 = torch.nn.functional.normalize(x1, dim=1)
         # x1[:, 0:3, :, :] = torch.tanh(x1[:, 0:3, :, :])
-        x1[:, 3, :, :] = torch.sigmoid(x1[:, 3, :, :])
-
-        N, C, H, W = x0.shape
-        assert (H == 1) and (W == 1), f"Expected H=1 and W=1 but got H={H} and W={W}"
+        x1[:, 3:4, :, :] = 0.5 + x1[:, 3:4, :, :] * 0.5
+        #N, C, H, W = x0.shape
+        #assert (H == 1) and (W == 1), f"Expected H=1 and W=1 but got H={H} and W={W}"
 
         x0 = x1[:, 0:3, :, :] # + self.gaussian_strokes(x0)
 
@@ -263,18 +279,48 @@ class SmolUnet(torch.nn.Module):
         # k =  x1[:, 3, :, :].unsqueeze(1)
         # x0 = torch.lerp(x0, kuwahara, k)
         # x0 = x0
-        # return x[:, 0:3, :, :]
-        return kuwahara
+        return x[:, 0:3, :, :]
+        # return kuwahara
 
 def get_model():
-    return SmolUnet(64)
+    block_out_channels=(128, 128, 256, 256, 512, 512)
+    down_block_types=( 
+        "DownBlock2D",  # a regular ResNet downsampling block
+        "DownBlock2D", 
+        "DownBlock2D", 
+        "DownBlock2D", 
+        "AttnDownBlock2D",  # a ResNet downsampling block with spatial self-attention
+        "DownBlock2D",
+    )
+    up_block_types=(
+        "UpBlock2D",  # a regular ResNet upsampling block
+        "AttnUpBlock2D",  # a ResNet upsampling block with spatial self-attention
+        "UpBlock2D", 
+        "UpBlock2D", 
+        "UpBlock2D", 
+        "UpBlock2D"  
+    )
+    return UNet2DModel(block_out_channels=block_out_channels,out_channels=3, in_channels=3, up_block_types=up_block_types, down_block_types=down_block_types, add_attention=True)
+
 
 @torch.no_grad()
-def sample_iadb(model, x0, nb_step):
+def sample_iadb1(model, x0, nb_step):
     x_alpha = x0
     dt = 1.0 / nb_step
     for t in range(nb_step):
         x_alpha           = model(x_alpha, dt)
+
+    return x_alpha
+
+@torch.no_grad()
+def sample_iadb(model, x0, nb_step):
+    x_alpha = x0
+    for t in range(nb_step):
+        alpha_start = (t/nb_step)
+        alpha_end =((t+1)/nb_step)
+
+        d = model(x_alpha, torch.tensor(alpha_start, device=x_alpha.device))['sample']
+        x_alpha = x_alpha + (alpha_end-alpha_start)*d
 
     return x_alpha
 
@@ -283,7 +329,7 @@ device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 # Load cats
 # https://www.kaggle.com/datasets/spandan2/cats-faces-64x64-for-generative-models
 size            = 64
-batch_size      = 16
+batch_size      = 64
 cat_tensors     = []
 cur_batch       = []
 MAX_NUM_CATS    = 1 << 10
@@ -306,8 +352,9 @@ for f in cats_folder.iterdir():
             cat_tensors.append(torch.cat(cur_batch, dim=0))
             cur_batch = []
     
-model = SmolUnet(device=device, input_resolution=64)
-
+# model = SmolUnet(device=device, input_resolution=64)
+model = get_model()
+model = model.to(device)
 # load checkpoint if exists
 
 ckpt = get_or_create_tmp() / "iadb.ckpt"
@@ -330,8 +377,13 @@ for current_epoch in range(100):
         alpha   = torch.rand((bs, 1, 1, 1), device=device)
         beta    = 1 - alpha
         x_alpha = torch.lerp(x1, x0, beta)
-        
-        x_alpha = model(x_alpha, beta)
+        num = 1
+        for t in range(num):
+            # x_alpha = model(x_alpha, beta / num)
+            #x_alpha = model(x_alpha, alpha[:, 0, 0, 0])
+            x_alpha = x_alpha + model(x_alpha, alpha[:, 0, 0, 0])['sample']
+
+        # x_alpha = model(x_alpha, beta)
         loss = torch.sum((x_alpha - x1)**2) + torch.sum(torch.abs(luma(x_alpha) - luma(x1)))
         # dalpha = alpha / 128.0
         # d     = torch.lerp(d, model.kuwahara(x1 + d) - x1, a)
@@ -343,11 +395,15 @@ for current_epoch in range(100):
 
         print(f'Epoch {current_epoch}, iter {i}, loss {loss.item()}')
 
-        nb_iter += 1
 
         if nb_iter % 200 == 0:
             with torch.no_grad():
                 print(f'Save export {nb_iter}')
+                #ones = torch.ones_like(x1)[:, 0:1, :, :]
+                #k = kuwahara(torch.cat([x1, ones], dim=1), 5, device)
+                #torchvision.utils.save_image(k * 0.5 + 0.5, get_or_create_tmp() / f'1_kuwahara.png')
+
                 sample = (sample_iadb(model, x0, nb_step=128) * 0.5) + 0.5
                 torchvision.utils.save_image(sample, get_or_create_tmp() / f'export_{str(nb_iter).zfill(8)}.png')
                 torch.save(model.state_dict(), ckpt)
+        nb_iter += 1
