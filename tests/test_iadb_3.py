@@ -38,12 +38,12 @@ class SmolBlock(torch.nn.Module):
 
         interim_features = out_channels
 
-        self.conv1          = torch.nn.Conv2d(in_channels=in_channels, out_channels=interim_features,
+        self.conv1          = torch.nn.Conv2d(in_channels=in_channels, out_channels=out_channels,
                                               kernel_size=kernel_size, stride=stride,
                                               padding=padding + (dilation - 1), dilation=dilation, groups=1, bias=True)
-        self.dwconv         = torch.nn.Conv2d(in_channels=interim_features,
+        self.dwconv         = torch.nn.Conv2d(in_channels=out_channels,
                                               out_channels=out_channels, kernel_size=1, stride=1, padding=0,
-                                              groups=out_channels, bias=True)
+                                              groups=1, bias=True)
         # self.spline_degree  = 4
         # self.spline_k       = torch.nn.Parameter(torch.randn(self.spline_degree, 1, out_channels, 1, 1), requires_grad=True)
         self.activation     = torch.nn.GELU()
@@ -52,6 +52,7 @@ class SmolBlock(torch.nn.Module):
     def forward(self, i):
         x = self.conv1(i)
         x0 = self.activation(x)
+        # x0 = torch.nn.Softmax2d()(x)
         x1 = self.dwconv(x0)
         # apply spline
         # x = x1 + self.activation2(x)
@@ -125,14 +126,56 @@ class GaussianStrokes(torch.nn.Module):
         return output_tensor
         # return centers, invsigmas, correlations
 
+def luma(x):
+    return (0.2126 * x[:, 0] + 0.7152 * x[:, 1] + 0.0722 * x[:, 2]).unsqueeze(1)
+
+class KuwaharaBlock(torch.nn.Module):
+    def __init__(self, device, kernel_size=3) -> None:
+        super().__init__()
+        self.kernel_size = kernel_size
+        self.device = device
+
+    def forward(self, input):
+        x           = input[:, 0:3, :, :]
+        power       = 16.0 * input[:, 3, :, :].unsqueeze(1)
+        mean        = torch.nn.AvgPool2d(kernel_size=self.kernel_size, stride=1, padding=self.kernel_size//2)(luma(x))
+        mean_sq     = torch.nn.AvgPool2d(kernel_size=self.kernel_size, stride=1, padding=self.kernel_size//2)(luma(x)**2)
+        variance    = torch.abs(mean_sq - mean**2)
+        # power       = 16.0
+        weights     = torch.exp(-variance * power)
+
+        N, C, H, W = x.shape
+        X = torch.range(0, W-1, device=self.device).view(1, 1, 1, W).expand(N, 1, H, W)
+        Y = torch.range(0, H-1, device=self.device).view(1, 1, H, 1).expand(N, 1, H, W)
+        acc = torch.zeros_like(x)
+        wacc = torch.zeros((N, 1, H, W), device=self.device)
+        for _dy in range(self.kernel_size):
+            for _dx in range(self.kernel_size):
+                dx = _dx - self.kernel_size // 2
+                dy = _dy - self.kernel_size // 2
+                _X = X + dx
+                _Y = Y + dy
+                _U = _X / W
+                _V = _Y / H
+                _ndc = torch.cat([_U, _V], dim=1) * 2.0 - 1.0
+                v = torch.nn.functional.grid_sample(x, _ndc.permute(0, 2, 3, 1), mode='nearest', padding_mode='border')
+                w = torch.nn.functional.grid_sample(weights, _ndc.permute(0, 2, 3, 1), mode='nearest', padding_mode='border')
+                w *= torch.exp(-(
+                                    torch.tensor([(dx / self.kernel_size)**2]) + torch.tensor([(dy / self.kernel_size)**2])
+                                  ).to(self.device))
+                acc += v * w
+                wacc += w
+
+        return acc / wacc
+
 class SmolUnet(torch.nn.Module):
 
     def __init__(self, device, input_resolution) -> None:
         super().__init__()
 
         self.num_features_0             = 4
-        self.num_output_channels        = 3
-        self.num_features_1             = 8
+        self.num_output_channels        = 4
+        self.num_features_1             = 16
         self.feature_extraction_conv    = torch.nn.Conv2d(in_channels=self.num_features_0,
                                                           out_channels=self.num_features_1,
                                                           kernel_size=3, stride=1, padding=1).to(device) 
@@ -159,42 +202,69 @@ class SmolUnet(torch.nn.Module):
         self.feature_final_conv = torch.nn.Conv2d(in_channels=num_features,
                                                   out_channels=self.num_output_channels, kernel_size=3, stride=1, padding=1).to(device)
 
-        self.gaussian_strokes = GaussianStrokes(
-                output_resolution=input_resolution,
-                num_gaussians=64,
-                num_features=self.final_features,
-                device=device)
+        self.kuwahara = KuwaharaBlock(device=device, kernel_size=5)
 
-    def forward(self, x, alpha):
+        # self.gaussian_strokes = GaussianStrokes(
+        #         output_resolution=input_resolution,
+        #         num_gaussians=64,
+        #         num_features=self.final_features,
+        #         device=device)
+
+    def forward(self, _i, dt = 1.0):
+        x = _i
         N, C, H, W = x.shape
-        x = torch.cat([x, torch.sin(alpha * torch.pi).unsqueeze(1).unsqueeze(1).unsqueeze(1).expand(N, 1, H, W)], dim=1)
+        mean = torch.nn.AvgPool2d(kernel_size=3, stride=1, padding=1)(luma(x))
+        mean2 = torch.nn.AvgPool2d(kernel_size=3, stride=1, padding=1)(luma(x)**2)
+        variance = torch.abs(mean2 - mean**2)
+        x = torch.cat([x,
+                       torch.exp(-variance),
+                    #    torch.sin(alpha * torch.pi).expand(N, 1, H, W)
+                       ], dim=1)
         fc = self.feature_extraction_conv(x)
         x0 = fc
         downs = []
         for down_module in self.down_modules:
             x0 = down_module(x0)
             x0 = torch.nn.MaxPool2d(kernel_size=2, stride=2)(x0)
+            x0 = torch.nn.BatchNorm2d(x0.shape[1], device=x0.device)(x0)
             downs.append(x0)
             # print(f"x0.shape = {x0.shape}")
 
+        downs.pop()
         x1 = x0
         for i, up_module in enumerate(self.up_modules):
-            d = downs.pop()
-            if i != 0:
-                x1 = up_module(x1 + d)
+            # d = downs.pop()
+            # if i != 0:
+                # x1 = up_module(x1 + d)
+            # else:
+            x1 = up_module(x1)
+            if len(downs) > 0:
+                x1 = torch.nn.Upsample(scale_factor=2, mode='bilinear')(x1)
+                x1 += downs.pop()
             else:
-                x1 = up_module(x1)
-            x1 = torch.nn.Upsample(scale_factor=2, mode='bilinear')(x1)
+                x1 = torch.nn.Upsample(scale_factor=2, mode='bilinear')(x1)
+            # x1 = torch.nn.BatchNorm2d(x1.shape[1], device=x0.device)(x1)
 
         x1 = self.feature_final_conv(x1 + fc)
-        x1 = torch.tanh(x1)
+        # x1 = torch.tanh(x1)
+        # x1[:, 0:3, :, :] = torch.nn.BatchNorm2d(num_features=3, device=x1.device)(x1[:, 0:3, :, :])
+        # x1[:, 0:3, :, :] = torch.tanh(x1[:, 0:3, :, :])
+        x1[:, 3, :, :] = torch.sigmoid(x1[:, 3, :, :])
 
         N, C, H, W = x0.shape
         assert (H == 1) and (W == 1), f"Expected H=1 and W=1 but got H={H} and W={W}"
 
-        x0 = x1 + self.gaussian_strokes(x0)
+        x0 = x1[:, 0:3, :, :] # + self.gaussian_strokes(x0)
 
-        return x0
+        x = x1
+        x[:, 0:3, :, :] = _i + dt * x[:, 0:3, :, :]
+
+        kuwahara = self.kuwahara(x)
+        # k =  x1[:, 3, :, :].unsqueeze(1)
+        # x0 = torch.lerp(x0, kuwahara, k)
+        # x0 = x0
+        # return x[:, 0:3, :, :]
+        return kuwahara
 
 def get_model():
     return SmolUnet(64)
@@ -202,12 +272,9 @@ def get_model():
 @torch.no_grad()
 def sample_iadb(model, x0, nb_step):
     x_alpha = x0
+    dt = 1.0 / nb_step
     for t in range(nb_step):
-        alpha_start = (t/nb_step)
-        alpha_end   = ((t+1)/nb_step)
-        d           = model(x_alpha, torch.tensor([alpha_start], device=x_alpha.device))
-        # return d
-        x_alpha     = x_alpha + (alpha_end - alpha_start) * d
+        x_alpha           = model(x_alpha, dt)
 
     return x_alpha
 
@@ -260,11 +327,15 @@ for current_epoch in range(100):
         x0 = torch.randn_like(x1)
         bs = x0.shape[0]
 
-        alpha   = torch.rand(bs, device=device)
-        x_alpha = alpha.view(-1, 1, 1, 1) * x1 + (1 - alpha).view(-1, 1, 1, 1) * x0
+        alpha   = torch.rand((bs, 1, 1, 1), device=device)
+        beta    = 1 - alpha
+        x_alpha = torch.lerp(x1, x0, beta)
         
-        d = model(x_alpha, alpha)
-        loss = torch.sum((d - (x1-x0))**2)
+        x_alpha = model(x_alpha, beta)
+        loss = torch.sum((x_alpha - x1)**2) + torch.sum(torch.abs(luma(x_alpha) - luma(x1)))
+        # dalpha = alpha / 128.0
+        # d     = torch.lerp(d, model.kuwahara(x1 + d) - x1, a)
+        # loss = torch.sum((d - (x1-x0))**2)
 
         optimizer.zero_grad()
         loss.backward()
