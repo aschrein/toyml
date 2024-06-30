@@ -1,0 +1,19 @@
+
+# https://scikit-build.readthedocs.io/en/latest/usage.html
+# https://github.com/pybind/scikit_build_example/blob/master/pyproject.toml
+[build-system]
+requires = [
+    "setuptools>=42",
+    "scikit-build>=0.13",
+    "cmake>=3.18",
+    "scikit-build-core>=0.3.3",
+    "pybind11",
+]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "ToyML"
+version = "0.0.0"
+authors = [
+    {name = "Anton Schreiner", email = "antonschrein@gmail.com"},
+]

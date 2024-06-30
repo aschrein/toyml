@@ -114,7 +114,18 @@ class TokenStream:
                     cur_str = ""
                 elif c in ['+', '-', '*', '/', '%', '>', '<', '=', '!', '&', '|', '^', '~', '?', ':', ';', ',', '.', '@', '#', '$', '`', '\\', '/', '(', ')', '{', '}', '[', ']']:
                     _flush_token()
-                    self.tokens.append(Token(TokenType.SPECIAL, c, line, col))
+
+                    # check if operator is a double operator
+                    dop = c + nc
+                    if dop in ['==', '!=', '>=', '<=', '&&', '||', '++', '--', '+=', '-=', '*=', '/=', '%=', '<<', '>>', '->', '=>', '::']:
+                        self.tokens.append(Token(TokenType.OPERATOR, dop, line, col))
+                        idx += 1
+                    
+                    # check if character is a single operator
+                    elif c in ['+', '-', '*', '/', '%', '>', '<', '=', '!', '&', '|', '^', '~', '?', ':', ';', ',', '.', '@', '#', '$']:
+                        self.tokens.append(Token(TokenType.OPERATOR, c, line, col))
+                    else:
+                        self.tokens.append(Token(TokenType.SPECIAL, c, line, col))
                 elif c.isdigit():
                     _flush_token()
                     cur_str += c
@@ -169,12 +180,75 @@ class TokenStream:
 
     def next(self):
         token = self.peek()
-        self.pos += 1
+        if token:
+            self.pos += 1
         return token
 
     def eof(self):
         return self.pos >= len(self.tokens)
 
+    def move_back(self):
+        self.pos -= 1
+
+# Lets get some basic arithmetic expression parsing
+
+class ASTNode:
+    def __init__(self, token=None):
+        self.token      = token
+        self.children   = []
+
+    def add_child(self, child):
+        self.children.append(child)
+
+    def __str__(self):
+        return f"ASTNode({self.token})"
+
+class ExprType(Enum):
+    LITERAL    = 0
+    UNARY      = 1
+    BINARY     = 2
+    PARANTHESIS= 3
+
+
+@dataclass
+class Expr:
+    type: ExprType
+    token: Token
+    args: list
+
+    @property
+    def value(self): return self.token.value
+
+    @property
+    def left(self): return self.args[0]
+    @property
+    def right(self): return self.args[1]
+
+
+def recursive_parse_expression(tk: TokenStream):
+    try:
+        c = tk.next()
+        if not c: return None
+        
+        if c.type == TokenType.OPERATOR: # unary operator
+            return Expr(ExprType.UNARY, c, [recursive_parse_expression(tk)])
+
+        n = tk.next()
+        if n is None:
+            return Expr(ExprType.LITERAL, c, [])
+        elif n.type == TokenType.OPERATOR: # binary operator
+            return Expr(ExprType.BINARY, n, [c, recursive_parse_expression(tk)])
+        elif n.value == '(':
+            p = Expr(ExprType.PARANTHESIS, c, [recursive_parse_expression(tk)])
+            assert tk.Consume(')'), f"Expected closing paranthesis"
+            return p
+        else:   
+            return Expr(ExprType.LITERAL, c, [])
+        
+    except Exception as e:
+        tk.print_error_at_current(f"Error while parsing expression: {e}")
+        raise e
+    
 
 if __name__ == "__main__":
     
@@ -208,4 +282,7 @@ if __name__ == "__main__":
         if t.is_float():
             print(f"{t.value} is a float = {t.get_float()}")
 
+    e = recursive_parse_expression(TokenStream("1 + 2 * 3", "test.dsl"))
+
+    print(e)
     pass
