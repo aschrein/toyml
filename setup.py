@@ -4,6 +4,6 @@ from setuptools import setup
 setup(
     name="toyml",
     version="1.0",
-    packages=['py'],
+    packages=['toyml', 'native', 'scripts'],
     cmake_source_dir='.',
 )
