@@ -23,3 +23,10 @@ torch.cuda.get_device_name(0)=NVIDIA GeForce GTX 1650 Ti
 All tests passed.
 
 ```
+
+# Log
+Keep getting this with wgpu gui examples
+```sh
+thread '<unnamed>' panicked at src\lib.rs:3846:17:
+Error in wgpuSurfaceGetPreferredFormat: unsupported format.
+```
