@@ -1,5 +1,5 @@
 <!doctype html>
-
+<!-- Based on https://github.com/boksajak/Dx12NN -->
 <html>
 
 <head>
@@ -9,6 +9,7 @@
 <!-- load and image and hide it -->
 <!-- <img id="MAIN_IMAGE_ID" src="https://r0k.us/graphics/kodak/kodak/kodim23.png" alt="kodim23" -->
 <!-- <img id="MAIN_IMAGE_ID" src="assets/kodim23.png" style="width: 512px; height: 512px;"> -->
+<img id="MAIN_IMAGE_ID" src="assets/mandrill.png" style="width: 512px; height: 512px;">
 
 <body>
     <canvas id="webgl_canvas" width="512" height="512"></canvas>
@@ -35,7 +36,8 @@
             return await createImageBitmap(blob, { colorSpaceConversion: 'none' });
         }
         // kodim23 parrots
-        var img = await loadImageBitmap('assets/kodim23.png');
+        // var img = await loadImageBitmap('assets/kodim23.png');
+        var img = await loadImageBitmap('assets/mandrill.png');
         // img = await loadImageBitmap('https://r0k.us/graphics/kodak/kodak/kodim23.png');
         // img = await loadImageBitmap('assets/kodim23.png');
         // console.log(img);
@@ -207,6 +209,14 @@ fn PSMain(
                             type: "storage",
                         },
                     },
+                    // uniform buffer
+                    {
+                        binding: 5,
+                        visibility: GPUShaderStage.COMPUTE,
+                        buffer: {
+                            type: "uniform",
+                        },
+                    }
                 ],
             });
 
@@ -233,8 +243,12 @@ fn PSMain(
         const height = 512;
         const pitch = 4 * 4 * width;
         const storage_buffer_size = pitch * height;
-        const params_storage_size = 1 << 20; // 1mb should be enough for now
-
+        const params_storage_size = 16 * (1 << 20); // 16mb should be enough for now
+        const uniform_buffer = device.createBuffer({
+            label: "uniform buffer",
+            size: 512,
+            usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+        });
         // const storage_array         = new Float32Array([1.0, 0.1, 0.5, 1.0]);
         const storage_buffer = device.createBuffer({
             label: "fullscreen buffer",
@@ -289,6 +303,7 @@ fn PSMain(
         const initialize_pso = make_pso("Initialize");
         const compute_pso = make_pso("Main");
         const backprop_pso = make_pso("Backward");
+        const inference_pso = make_pso("InferencePass");
 
         const compute_bind_group = device.createBindGroup({
             layout: compute_bind_group_layout,
@@ -298,10 +313,15 @@ fn PSMain(
                 { binding: 2, resource: texture.createView() },
                 { binding: 3, resource: { buffer: params_buffer } },
                 { binding: 4, resource: { buffer: grads_buffer } },
+                { binding: 5, resource: { buffer: uniform_buffer } },
             ],
         });
         var frame_idx = 0;
         let render = function () {
+            
+            // Update the uniform buffer
+            const uniform_array = new Float32Array([frame_idx]);
+            device.queue.writeBuffer(uniform_buffer, 0, uniform_array.buffer);
 
             const encoder = device.createCommandEncoder();
 
@@ -318,6 +338,10 @@ fn PSMain(
                 compute_pass.dispatchWorkgroups(dispatch_resolution.x, dispatch_resolution.y, dispatch_resolution.z);
             }
             compute_pass.setPipeline(compute_pso);
+            compute_pass.dispatchWorkgroups(8, 8, dispatch_resolution.z);
+            compute_pass.setPipeline(backprop_pso);
+            compute_pass.dispatchWorkgroups(dispatch_resolution.x, dispatch_resolution.y, dispatch_resolution.z);
+            compute_pass.setPipeline(inference_pso);
             compute_pass.dispatchWorkgroups(dispatch_resolution.x, dispatch_resolution.y, dispatch_resolution.z);
             compute_pass.end();
 
